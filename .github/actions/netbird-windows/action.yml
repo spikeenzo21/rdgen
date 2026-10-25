@@ -1,4 +1,3 @@
-
 name: NetBird Windows per RDGen
 description: Connette un runner Windows a NetBird e verifica RDGen privato
 
@@ -83,7 +82,7 @@ runs:
               exit 0
             }
           } catch {
-            Write-Host "Tentativo $i: connessione non ancora pronta"
+            Write-Host "Tentativo ${i}: connessione non ancora pronta"
           }
           Start-Sleep -Seconds 5
         }
