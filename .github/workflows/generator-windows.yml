@@ -51,6 +51,9 @@ jobs:
     uses: ./.github/workflows/fetch-encrypted-secrets.yml
     with:
       zip_url_json: ${{ inputs.zip_url }}
+      use_netbird: true
+    secrets:
+      NETBIRD_SETUP_KEY: ${{ secrets.NETBIRD_SETUP_KEY }}
 
   generate-bridge:
     uses: ./.github/workflows/bridge.yml
