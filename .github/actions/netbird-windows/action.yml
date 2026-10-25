@@ -1,0 +1,90 @@
+
+name: NetBird Windows per RDGen
+description: Connette un runner Windows a NetBird e verifica RDGen privato
+
+inputs:
+  setup_key:
+    description: Setup key NetBird
+    required: true
+  management_url:
+    description: URL NetBird Self-Hosted
+    required: true
+  rdgen_url:
+    description: URL RDGen tramite NetBird
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Installa NetBird
+      shell: pwsh
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $headers = @{
+          Authorization = "Bearer $env:GH_TOKEN"
+          'User-Agent' = 'rdgen-netbird'
+        }
+        $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/netbirdio/netbird/releases/tags/v0.81.4' -Headers $headers
+        $asset = $release.assets | Where-Object {
+          $_.name -match '^netbird_installer_.*_windows_amd64\.exe$'
+        } | Select-Object -First 1
+        if (-not $asset) { throw 'Installer NetBird non trovato' }
+
+        $installer = Join-Path $env:RUNNER_TEMP 'netbird-installer.exe'
+        Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $installer
+        if ($asset.digest -notmatch '^sha256:([a-fA-F0-9]{64})$') {
+          throw 'Hash SHA256 NetBird mancante'
+        }
+        $expected = $Matches[1]
+        $actual = (Get-FileHash $installer -Algorithm SHA256).Hash
+        if ($actual -ne $expected) { throw 'Hash NetBird non corrispondente' }
+
+        $p = Start-Process -FilePath $installer -ArgumentList '/S' -Wait -PassThru
+        if ($p.ExitCode -ne 0) { throw "Installazione NetBird fallita: $($p.ExitCode)" }
+
+    - name: Connetti NetBird
+      shell: pwsh
+      env:
+        NB_KEY: ${{ inputs.setup_key }}
+        NB_MGMT: ${{ inputs.management_url }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+        if (-not $env:NB_KEY -or -not $env:NB_MGMT) {
+          throw 'Chiave NetBird o management URL mancante'
+        }
+        $nb = Join-Path $env:ProgramFiles 'NetBird\netbird.exe'
+        $ready = $false
+        for ($i = 1; $i -le 20; $i++) {
+          $service = Get-Service Netbird -ErrorAction SilentlyContinue
+          if ((Test-Path $nb) -and $service -and $service.Status -eq 'Running') {
+            $ready = $true
+            break
+          }
+          Start-Sleep -Seconds 3
+        }
+        if (-not $ready) { throw 'Servizio NetBird non pronto' }
+        & $nb up --setup-key $env:NB_KEY --management-url $env:NB_MGMT
+        if ($LASTEXITCODE -ne 0) { throw 'Connessione NetBird fallita' }
+
+    - name: Attendi RDGen privato
+      shell: pwsh
+      env:
+        RDGEN_URL: ${{ inputs.rdgen_url }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+        if (-not $env:RDGEN_URL) { throw 'GENURL mancante' }
+        for ($i = 1; $i -le 12; $i++) {
+          try {
+            $r = Invoke-WebRequest -Uri "$($env:RDGEN_URL)/" -TimeoutSec 10
+            if ($r.StatusCode -eq 200) {
+              Write-Host 'RDGen raggiungibile via NetBird: HTTP 200'
+              exit 0
+            }
+          } catch {
+            Write-Host "Tentativo $i: connessione non ancora pronta"
+          }
+          Start-Sleep -Seconds 5
+        }
+        throw 'RDGen non raggiungibile via NetBird'
