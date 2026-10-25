@@ -1,3 +1,4 @@
+
 name: Test RDGen via NetBird
 
 on:
@@ -17,26 +18,49 @@ jobs:
         uses: ankurk91/netbird-action@v2
         with:
           setup-key: ${{ secrets.NETBIRD_SETUP_KEY }}
-          management-url: ${{ vars.NETBIRD_MANAGEMENT_URL || 'https://api.netbird.io:443' }}
+          management-url: ${{ vars.NETBIRD_MANAGEMENT_URL }}
           peer-name: rdgen-test-${{ github.run_id }}-${{ github.run_attempt }}
 
-      - name: Verifica RDGen
+      - name: Diagnostica connessione RDGen
         env:
           GENURL: ${{ secrets.GENURL }}
+        shell: bash
         run: |
+          set -u
+
           if [ -z "$GENURL" ]; then
-            echo "ERRORE: GENURL non configurato"
+            echo "ERRORE: GENURL mancante"
             exit 1
           fi
 
-          STATUS=$(curl \
-            --connect-timeout 10 \
-            --max-time 20 \
-            -sS -o /dev/null \
-            -w '%{http_code}' \
-            "$GENURL/")
+          HOST=$(echo "$GENURL" | sed -E 's#^https?://([^:/]+).*#\1#')
 
-          echo "RDGen HTTP: $STATUS"
-          test "$STATUS" = "200"
+          echo "=== VERIFICA PEER NETBIRD ==="
+          if netbird status --detail | grep -Fq "NetBird IP: $HOST"; then
+            echo "Peer RDGen PRESENTE"
+          else
+            echo "Peer RDGen NON PRESENTE"
+          fi
 
-          echo "Connessione privata RDGen riuscita"
+          echo "=== VERIFICA ROTTA ==="
+          ip -4 route get "$HOST" || true
+
+          echo "=== TEST TCP RDGEN ==="
+          for i in 1 2 3 4 5 6; do
+            echo "Tentativo $i"
+
+            if curl --noproxy '*' \
+              --connect-timeout 5 \
+              --max-time 10 \
+              -fsS -o /dev/null \
+              -w 'RDGen HTTP: %{http_code}\n' \
+              "$GENURL/"; then
+              echo "CONNESSIONE RIUSCITA"
+              exit 0
+            fi
+
+            sleep 5
+          done
+
+          echo "ERRORE: RDGen non raggiungibile"
+          exit 1
