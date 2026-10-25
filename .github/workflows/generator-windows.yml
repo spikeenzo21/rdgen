@@ -96,6 +96,13 @@ jobs:
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
+
+      - name: Connessione privata RDGen
+        uses: ./.github/actions/netbird-windows
+        with:
+          setup_key: ${{ secrets.NETBIRD_SETUP_KEY }}
+          management_url: ${{ vars.NETBIRD_MANAGEMENT_URL }}
+          rdgen_url: ${{ secrets.GENURL }}
         
       - uses: actions/download-artifact@v4
         with:
@@ -781,6 +788,16 @@ jobs:
           command: |
             curl -i -X POST -H "Content-Type: multipart/form-data" -H "Authorization: Bearer ${{ env.token }}" -F "file=@./SignOutput/${{ env.filename }}.exe" ${{ env.apiServer }}/api/save_custom_client
             curl -i -X POST -H "Content-Type: multipart/form-data" -H "Authorization: Bearer ${{ env.token }}" -F "file=@./SignOutput/${{ env.filename }}.msi" ${{ env.apiServer }}/api/save_custom_client || true
+
+      - name: Disconnetti NetBird
+        if: always()
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $nb = Join-Path $env:ProgramFiles 'NetBird\netbird.exe'
+          if (Test-Path $nb) {
+            & $nb down
+          }
 
   cleanup:
     needs: [build-for-windows-flutter]
