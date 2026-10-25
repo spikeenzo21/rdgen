@@ -1,0 +1,42 @@
+name: Test RDGen via NetBird
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-rdgen:
+    name: Test accesso privato RDGen
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Connetti NetBird
+        uses: ankurk91/netbird-action@v2
+        with:
+          setup-key: ${{ secrets.NETBIRD_SETUP_KEY }}
+          management-url: ${{ vars.NETBIRD_MANAGEMENT_URL || 'https://api.netbird.io:443' }}
+          peer-name: rdgen-test-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Verifica RDGen
+        env:
+          GENURL: ${{ secrets.GENURL }}
+        run: |
+          if [ -z "$GENURL" ]; then
+            echo "ERRORE: GENURL non configurato"
+            exit 1
+          fi
+
+          STATUS=$(curl \
+            --connect-timeout 10 \
+            --max-time 20 \
+            -sS -o /dev/null \
+            -w '%{http_code}' \
+            "$GENURL/")
+
+          echo "RDGen HTTP: $STATUS"
+          test "$STATUS" = "200"
+
+          echo "Connessione privata RDGen riuscita"
