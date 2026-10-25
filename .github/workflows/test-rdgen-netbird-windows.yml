@@ -1,0 +1,139 @@
+
+name: Test RDGen NetBird Windows
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-windows:
+    runs-on: windows-2022
+    timeout-minutes: 15
+
+    steps:
+      - name: Installa NetBird
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $headers = @{
+            Authorization = "Bearer $env:GH_TOKEN"
+            "User-Agent" = "rdgen-netbird-test"
+          }
+
+          $release = Invoke-RestMethod `
+            -Uri "https://api.github.com/repos/netbirdio/netbird/releases/tags/v0.81.4" `
+            -Headers $headers
+
+          $asset = $release.assets |
+            Where-Object {
+              $_.name -match "^netbird_installer_.*_windows_amd64\.exe$"
+            } | Select-Object -First 1
+
+          if (-not $asset) {
+            throw "Installer NetBird non trovato"
+          }
+
+          $installer = Join-Path $env:RUNNER_TEMP "netbird-installer.exe"
+
+          Invoke-WebRequest -Uri $asset.browser_download_url `
+            -OutFile $installer
+
+          if ($asset.digest -notmatch "^sha256:([a-fA-F0-9]{64})$") {
+            throw "Hash SHA256 ufficiale non disponibile"
+          }
+
+          $expectedHash = $Matches[1]
+          $actualHash = (Get-FileHash $installer -Algorithm SHA256).Hash
+
+          if ($actualHash -ne $expectedHash) {
+            throw "Verifica integrita installer fallita"
+          }
+
+          $process = Start-Process -FilePath $installer `
+            -ArgumentList "/S" -Wait -PassThru
+
+          if ($process.ExitCode -ne 0) {
+            throw "Installazione fallita: $($process.ExitCode)"
+          }
+
+          Write-Host "NetBird installato"
+
+      - name: Connetti NetBird
+        shell: pwsh
+        env:
+          NB_KEY: ${{ secrets.NETBIRD_SETUP_KEY }}
+          NB_MGMT: ${{ vars.NETBIRD_MANAGEMENT_URL }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if (-not $env:NB_KEY -or -not $env:NB_MGMT) {
+            throw "Configurazione NetBird mancante"
+          }
+
+          $nb = Join-Path $env:ProgramFiles "NetBird\netbird.exe"
+
+          for ($i = 1; $i -le 20; $i++) {
+            $service = Get-Service Netbird -ErrorAction SilentlyContinue
+            if ((Test-Path $nb) -and $service.Status -eq "Running") {
+              break
+            }
+            Start-Sleep -Seconds 3
+          }
+
+          if (-not (Test-Path $nb)) {
+            throw "NetBird non trovato"
+          }
+
+          & $nb up --setup-key $env:NB_KEY --management-url $env:NB_MGMT
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Connessione NetBird fallita"
+          }
+
+          Write-Host "NetBird connesso"
+
+      - name: Verifica RDGen
+        shell: pwsh
+        env:
+          GENURL: ${{ secrets.GENURL }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if (-not $env:GENURL) {
+            throw "GENURL mancante"
+          }
+
+          for ($i = 1; $i -le 12; $i++) {
+            try {
+              $response = Invoke-WebRequest `
+                -Uri "$($env:GENURL)/" `
+                -TimeoutSec 10
+
+              if ($response.StatusCode -eq 200) {
+                Write-Host "RDGen HTTP 200"
+                Write-Host "TEST WINDOWS RIUSCITO"
+                exit 0
+              }
+            }
+            catch {
+              Write-Host "Tentativo $i non riuscito"
+            }
+
+            Start-Sleep -Seconds 5
+          }
+
+          throw "RDGen non raggiungibile"
+
+      - name: Disconnetti NetBird
+        if: always()
+        shell: pwsh
+        run: |
+          $nb = Join-Path $env:ProgramFiles "NetBird\netbird.exe"
+          if (Test-Path $nb) {
+            & $nb down
+          }
