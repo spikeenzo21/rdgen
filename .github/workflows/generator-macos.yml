@@ -49,6 +49,9 @@ jobs:
     uses: ./.github/workflows/fetch-encrypted-secrets.yml
     with:
       zip_url_json: ${{ inputs.zip_url }}
+      use_netbird: true
+    secrets:
+      NETBIRD_SETUP_KEY: ${{ secrets.NETBIRD_SETUP_KEY }}
 
   generate-bridge:
     uses: ./.github/workflows/bridge.yml
@@ -72,7 +75,7 @@ jobs:
             }
           - {
               target: aarch64-apple-darwin,
-              os: macos-14,
+              os: macos-15,
               # extra-build-args: "--disable-flutter-texture-render", # disable this for mac, because we see a lot of users reporting flickering both on arm and x64, and we can not confirm if texture rendering has better performance if htere is no vram, https://github.com/rustdesk/rustdesk/issues/6296
               extra-build-args: "--screencapturekit",
               arch: aarch64,
@@ -84,6 +87,71 @@ jobs:
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
+      - name: Verifica configurazione privata macOS
+        shell: bash
+        env:
+          NB_SETUP_KEY: ${{ secrets.NETBIRD_SETUP_KEY }}
+          NB_MANAGEMENT_URL: ${{ vars.NETBIRD_MANAGEMENT_URL }}
+          RDGEN_URL: ${{ secrets.GENURL }}
+        run: |
+          set -euo pipefail
+          if [ -z "$NB_SETUP_KEY" ] || [ -z "$NB_MANAGEMENT_URL" ] || [ -z "$RDGEN_URL" ]; then
+            echo 'ERRORE: uno o piu parametri NetBird/RDGen mancanti'
+            exit 1
+          fi
+          if [[ "$NB_MANAGEMENT_URL" != https://* ]]; then
+            echo 'ERRORE: il management NetBird deve usare HTTPS'
+            exit 1
+          fi
+          echo 'Parametri di connessione privata presenti'
+
+      - name: Installa NetBird CLI macOS
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install netbirdio/tap/netbird
+          NB_BIN="$(command -v netbird)"
+          "$NB_BIN" version
+          sudo -n "$NB_BIN" service install
+          sudo -n "$NB_BIN" service start
+
+      - name: Connetti NetBird self-hosted macOS
+        shell: bash
+        env:
+          NB_SETUP_KEY: ${{ secrets.NETBIRD_SETUP_KEY }}
+          NB_MANAGEMENT_URL: ${{ vars.NETBIRD_MANAGEMENT_URL }}
+          NB_HOSTNAME: rdgen-macos-${{ strategy.job-index }}-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          for attempt in {1..12}; do
+            if netbird up --setup-key "$NB_SETUP_KEY" --management-url "$NB_MANAGEMENT_URL" --hostname "$NB_HOSTNAME" >/dev/null 2>&1; then
+              echo 'Connessione NetBird richiesta: OK'
+              exit 0
+            fi
+            echo "NetBird non pronto: tentativo ${attempt}/12"
+            sleep 5
+          done
+          echo 'ERRORE: impossibile connettere NetBird'
+          exit 1
+
+      - name: Verifica accesso RDGen privato (macOS)
+        shell: bash
+        env:
+          RDGEN_URL: ${{ secrets.GENURL }}
+        run: |
+          set -euo pipefail
+          for attempt in {1..15}; do
+            code="$(curl --noproxy '*' --silent --output /dev/null --write-out '%{http_code}' --connect-timeout 5 --max-time 10 "${RDGEN_URL%/}/" || true)"
+            if [ "$code" = '200' ]; then
+              echo 'RDGen HTTP 200: macOS pronto'
+              exit 0
+            fi
+            echo "RDGen non raggiungibile: tentativo ${attempt}/15 (HTTP ${code})"
+            sleep 5
+          done
+          echo 'ERRORE: RDGen non raggiungibile via NetBird'
+          exit 1
+
         
       - uses: actions/download-artifact@v4
         with:
@@ -131,8 +199,8 @@ jobs:
         if: ${{ inputs.app_version != '' }}
         shell: bash
         run: |
-          sed -i -e 's|^version = ".*"|version = "${{ inputs.app_version }}"|' ./Cargo.toml
-          sed -i '/name = "rustdesk"/ {n; s/version = ".*"/version = "${{ inputs.app_version }}"/}' ./Cargo.lock
+          sed -i '' -e 's|^version = ".*"|version = "${{ inputs.app_version }}"|' ./Cargo.toml
+          sed -i '' '/name = "rustdesk"/ {n; s/version = ".*"/version = "${{ inputs.app_version }}"/}' ./Cargo.lock
           grep '^version = ' ./Cargo.toml
 
       - name: Apply allow_custom_update patch
@@ -149,36 +217,79 @@ jobs:
       - name: Install imagemagick and potrace and nasm and and
         shell: bash
         run: |
-          brew install imagemagick potrace nasm cmake gcc wget ninja
+          brew install imagemagick potrace cmake gcc wget ninja
           echo "$(brew --prefix imagemagick)/bin" >> $GITHUB_PATH
 
       - name: Update macOS Info.plist and settings
         continue-on-error: false
         shell: bash
+        env:
+          RDGEN_APP_NAME: ${{ env.appname }}
+          RDGEN_COMPANY: ${{ env.compname }}
         run: |
-          # MACSTUFF Update Info.plist
-          sed -i '' -e 's|<key>CFBundleName</key>.*<string>.*</string>|<key>CFBundleName</key>\n\t<string>${{ env.appname }}</string>|' ./flutter/macos/Runner/Info.plist
-          sed -i '' -e 's|<key>CFBundleDisplayName</key>.*<string>.*</string>|<key>CFBundleDisplayName</key>\n\t<string>${{ env.appname }}</string>|' ./flutter/macos/Runner/Info.plist
-          sed -i '' -e 's|<key>CFBundleIdentifier</key>.*<string>.*</string>|<key>CFBundleIdentifier</key>\n\t<string>com.${{ env.appname }}.app</string>|' ./flutter/macos/Runner/Info.plist
+          set -euo pipefail
+          # Preserve the human-readable app name; use a safe reverse-DNS Bundle ID.
+          # macOS Info.plist has the <key> and <string> on DIFFERENT lines.
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          import os, plistlib, re, unicodedata
           
-          # MACSTUFF Update AppInfo.xcconfig
-          sed -i '' -e 's|PRODUCT_NAME = .*|PRODUCT_NAME = ${{ env.appname }}|' ./flutter/macos/Runner/Configs/AppInfo.xcconfig
-          sed -i '' -e 's|PRODUCT_BUNDLE_IDENTIFIER = .*|PRODUCT_BUNDLE_IDENTIFIER = com.${{ env.appname }}.app|' ./flutter/macos/Runner/Configs/AppInfo.xcconfig
+          app = os.environ.get('RDGEN_APP_NAME', '').strip()
+          company = os.environ.get('RDGEN_COMPANY', '').strip() or 'rdgen'
+          if not app or any(ch in app for ch in '\r\n/\\:'):
+              raise SystemExit('Nome applicazione macOS mancante o non valido')
+          
+          def slug(value):
+              normalized = unicodedata.normalize('NFKD', value).encode('ascii', 'ignore').decode().lower()
+              return re.sub(r'[^a-z0-9]+', '-', normalized).strip('-')
+          
+          vendor = slug(company) or 'rdgen'
+          product = slug(app)
+          if not product:
+              raise SystemExit('Impossibile creare Bundle ID macOS dal nome app')
+          bundle = f'com.{vendor}.{product}'
+          
+          plist_path = Path('flutter/macos/Runner/Info.plist')
+          with plist_path.open('rb') as f:
+              plist = plistlib.load(f)
+          plist['CFBundleName'] = app
+          plist['CFBundleDisplayName'] = app
+          plist['CFBundleIdentifier'] = bundle
+          with plist_path.open('wb') as f:
+              plistlib.dump(plist, f)
+          
+          xcconfig_path = Path('flutter/macos/Runner/Configs/AppInfo.xcconfig')
+          xcconfig = xcconfig_path.read_text()
+          xcconfig, num_name = re.subn(r'(?m)^PRODUCT_NAME\s*=.*$', f'PRODUCT_NAME = {app}', xcconfig)
+          xcconfig, num_bundle = re.subn(r'(?m)^PRODUCT_BUNDLE_IDENTIFIER\s*=.*$', f'PRODUCT_BUNDLE_IDENTIFIER = {bundle}', xcconfig)
+          if num_name != 1 or num_bundle != 1:
+              raise SystemExit('PRODUCT_NAME / PRODUCT_BUNDLE_IDENTIFIER mancanti in xcconfig')
+          xcconfig_path.write_text(xcconfig)
+          
+          project_path = Path('flutter/macos/Runner.xcodeproj/project.pbxproj')
+          project = project_path.read_text()
+          project, count = re.subn(r'PRODUCT_BUNDLE_IDENTIFIER\s*=\s*[^;]+;', f'PRODUCT_BUNDLE_IDENTIFIER = {bundle};', project)
+          if count < 1:
+              raise SystemExit('PRODUCT_BUNDLE_IDENTIFIER mancante nel progetto Xcode')
+          project_path.write_text(project)
+          print('Nome:', app)
+          print('Bundle ID:', bundle)
+          print('Configurazione Xcode: OK')
+          PYCODE
+          
           sed -i '' -e 's|Purslane Tech Pte. Ltd.|${{ env.compname }}|' ./flutter/macos/Runner/Configs/AppInfo.xcconfig
           sed -i '' -e 's|Purslane Ltd.|${{ env.compname }}|' ./flutter/macos/Runner/Configs/AppInfo.xcconfig
 
-          sed -i -e 's|Purslane Tech Pte. Ltd.|${{ env.compname }}|' ./Cargo.toml
-          sed -i -e 's|Purslane Tech Pte. Ltd.|${{ env.compname }}|' ./libs/portable/Cargo.toml
-          sed -i -e 's|Purslane Tech Pte. Ltd.|${{ env.compname }}|' ./flutter/lib/desktop/pages/desktop_setting_page.dart
-          sed -i -e 's|Purslane Tech Pte. Ltd.|${{ env.compname }}|' ./src/main.rs
-          sed -i -e 's|Purslane Ltd.|${{ env.compname }}|' ./Cargo.toml
-          sed -i -e 's|Purslane Ltd.|${{ env.compname }}|' ./libs/portable/Cargo.toml
-          sed -i -e 's|Purslane Ltd.|${{ env.compname }}|' ./flutter/lib/desktop/pages/desktop_setting_page.dart
-          sed -i -e 's|Purslane Ltd|${{ env.compname }}|' ./src/main.rs
+          sed -i '' -e 's|Purslane Tech Pte. Ltd.|${{ env.compname }}|' ./Cargo.toml
+          sed -i '' -e 's|Purslane Tech Pte. Ltd.|${{ env.compname }}|' ./libs/portable/Cargo.toml
+          sed -i '' -e 's|Purslane Tech Pte. Ltd.|${{ env.compname }}|' ./flutter/lib/desktop/pages/desktop_setting_page.dart
+          sed -i '' -e 's|Purslane Tech Pte. Ltd.|${{ env.compname }}|' ./src/main.rs
+          sed -i '' -e 's|Purslane Ltd.|${{ env.compname }}|' ./Cargo.toml
+          sed -i '' -e 's|Purslane Ltd.|${{ env.compname }}|' ./libs/portable/Cargo.toml
+          sed -i '' -e 's|Purslane Ltd.|${{ env.compname }}|' ./flutter/lib/desktop/pages/desktop_setting_page.dart
+          sed -i '' -e 's|Purslane Ltd|${{ env.compname }}|' ./src/main.rs
           
           # Update Xcode project settings
-          sed -i '' -e 's/PRODUCT_NAME = "RustDesk"/PRODUCT_NAME = "${{ env.appname }}"/' ./flutter/macos/Runner.xcodeproj/project.pbxproj
-          sed -i '' -e 's/PRODUCT_BUNDLE_IDENTIFIER = ".*"/PRODUCT_BUNDLE_IDENTIFIER = "com.${{ env.appname }}.app"/' ./flutter/macos/Runner.xcodeproj/project.pbxproj
 
           # Update CMake settings
           if [ -f "./flutter/macos/CMakeLists.txt" ]; then
@@ -204,11 +315,11 @@ jobs:
         continue-on-error: true
         shell: bash
         run: |
-          sed -i -e 's|https://rustdesk.com/download|${{ env.downloadLink }}|' ./flutter/lib/desktop/pages/desktop_home_page.dart
-          sed -i -e 's|https://rustdesk.com/download|${{ env.downloadLink }}|' ./flutter/lib/mobile/pages/connection_page.dart
-          sed -i -e 's|https://rustdesk.com/download|${{ env.downloadLink }}|' ./src/ui/index.tis
-          sed -i -e 's|&download_url|"${{ env.downloadLink }}"|' ./src/updater.rs
-          sed -i -e 's|$downloadUrl/$downloadFile|${{ env.downloadLink }}|' ./flutter/lib/desktop/widgets/update_progress.dart
+          sed -i '' -e 's|https://rustdesk.com/download|${{ env.downloadLink }}|' ./flutter/lib/desktop/pages/desktop_home_page.dart
+          sed -i '' -e 's|https://rustdesk.com/download|${{ env.downloadLink }}|' ./flutter/lib/mobile/pages/connection_page.dart
+          sed -i '' -e 's|https://rustdesk.com/download|${{ env.downloadLink }}|' ./src/ui/index.tis
+          sed -i '' -e 's|&download_url|"${{ env.downloadLink }}"|' ./src/updater.rs
+          sed -i '' -e 's|$downloadUrl/$downloadFile|${{ env.downloadLink }}|' ./flutter/lib/desktop/widgets/update_progress.dart
           
           # Update slogan - About in en.rs 
           sed -i '' -e 's/("Slogan_tip", "Made with heart in this chaotic world!")/("Slogan_tip", "Powered by ${{ env.appname }}")/' ./src/lang/en.rs
@@ -229,7 +340,7 @@ jobs:
           rm ./flutter/temp_dependency.txt 
 
       - name: set server, serverPort, key, and apiserver
-        continue-on-error: true
+        continue-on-error: false
         shell: bash
         env:
           SERVER_DOMAIN: ${{ env.server }}
@@ -237,7 +348,12 @@ jobs:
           SERVER_KEY: ${{ env.key }}
           API_SERVER: ${{ env.apiServer }}
         run: |
+          set -euo pipefail
           # Pass secrets via bash env vars to avoid quoting issues
+          if [ -z "$SERVER_DOMAIN" ] || [ -z "$SERVER_KEY" ] || [ -z "$API_SERVER" ]; then
+            echo 'ERRORE: server, chiave o API BetterDesk mancanti nella generazione'
+            exit 1
+          fi
           if [ ! -f "./libs/hbb_common/src/config.rs" ]; then
             echo "Error: config.rs not found!"
             exit 1
@@ -263,19 +379,24 @@ jobs:
           echo "Setting server: $SERVER_DOMAIN"
           echo "Setting ports: $SERVER_PORT, $RELAY_PORT, $WS_RENDEZVOUS_PORT, $WS_RELAY_PORT"
 
-          sed -i -e "s|rs-ny.rustdesk.com|$SERVER_DOMAIN|" ./libs/hbb_common/src/config.rs
+          sed -i '' -e "s|rs-ny.rustdesk.com|$SERVER_DOMAIN|" ./libs/hbb_common/src/config.rs
 
           # Match on numeric value so the step is independent of defaults
-          sed -i -e "s|pub const RENDEZVOUS_PORT: i32 = [0-9][0-9]*;|pub const RENDEZVOUS_PORT: i32 = $SERVER_PORT;|" ./libs/hbb_common/src/config.rs
-          sed -i -e "s|pub const RELAY_PORT: i32 = [0-9][0-9]*;|pub const RELAY_PORT: i32 = $RELAY_PORT;|" ./libs/hbb_common/src/config.rs
-          sed -i -e "s|pub const WS_RENDEZVOUS_PORT: i32 = [0-9][0-9]*;|pub const WS_RENDEZVOUS_PORT: i32 = $WS_RENDEZVOUS_PORT;|" ./libs/hbb_common/src/config.rs
-          sed -i -e "s|pub const WS_RELAY_PORT: i32 = [0-9][0-9]*;|pub const WS_RELAY_PORT: i32 = $WS_RELAY_PORT;|" ./libs/hbb_common/src/config.rs
+          sed -i '' -e "s|pub const RENDEZVOUS_PORT: i32 = [0-9][0-9]*;|pub const RENDEZVOUS_PORT: i32 = $SERVER_PORT;|" ./libs/hbb_common/src/config.rs
+          sed -i '' -e "s|pub const RELAY_PORT: i32 = [0-9][0-9]*;|pub const RELAY_PORT: i32 = $RELAY_PORT;|" ./libs/hbb_common/src/config.rs
+          sed -i '' -e "s|pub const WS_RENDEZVOUS_PORT: i32 = [0-9][0-9]*;|pub const WS_RENDEZVOUS_PORT: i32 = $WS_RENDEZVOUS_PORT;|" ./libs/hbb_common/src/config.rs
+          sed -i '' -e "s|pub const WS_RELAY_PORT: i32 = [0-9][0-9]*;|pub const WS_RELAY_PORT: i32 = $WS_RELAY_PORT;|" ./libs/hbb_common/src/config.rs
 
-          sed -i -e "s|OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=|$SERVER_KEY|" ./libs/hbb_common/src/config.rs
-          sed -i -e "s|https://admin.rustdesk.com|$API_SERVER|" ./src/common.rs
+          sed -i '' -e "s|OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=|$SERVER_KEY|" ./libs/hbb_common/src/config.rs
+          sed -i '' -e "s|https://admin.rustdesk.com|$API_SERVER|" ./src/common.rs
 
-          echo "=== Verification ==="
-          grep -nE "RENDEZVOUS_PORT|RELAY_PORT|WS_" ./libs/hbb_common/src/config.rs
+          # Verify that the sources actually contain the expected configuration.
+          # sed can return zero even when the source text has not been changed.
+          grep -Fq "$SERVER_DOMAIN" ./libs/hbb_common/src/config.rs || { echo 'ERRORE: server ID non configurato'; exit 1; }
+          grep -Fq "$SERVER_KEY" ./libs/hbb_common/src/config.rs || { echo 'ERRORE: chiave pubblica non configurata'; exit 1; }
+          grep -Fq "pub const RENDEZVOUS_PORT: i32 = $SERVER_PORT;" ./libs/hbb_common/src/config.rs || { echo 'ERRORE: porta ID non configurata'; exit 1; }
+          grep -Fq "$API_SERVER" ./src/common.rs || { echo 'ERRORE: URL API non configurato'; exit 1; }
+          echo "Configurazione BetterDesk verificata (ID port $SERVER_PORT; relay port $RELAY_PORT)"
 
       - name: allow custom.txt
         uses: nick-fields/retry@v3
@@ -301,16 +422,23 @@ jobs:
               brew install pkg-config
           fi
 
-      - name: Install NASM
+      - name: Install NASM 2.16.03 (both macOS architectures)
+        shell: bash
         run: |
-          # Install NASM 2.16.x from official release.
-          # Do NOT use `brew install nasm` which installs NASM 3.x.
-          # NASM 3.x is a complete rewrite with incompatible CLI options and removed features.
-          # aom and other multimedia libraries require NASM 2.x for x86/x86_64 assembly.
-          wget https://www.nasm.us/pub/nasm/releasebuilds/2.16.03/macosx/nasm-2.16.03-macosx.zip
-          unzip nasm-2.16.03-macosx.zip
-          sudo cp nasm-2.16.03/nasm /usr/local/bin/nasm
-          nasm --version
+          set -euo pipefail
+          # NASM 3.x can break the pinned multimedia build dependencies.
+          # Build NASM 2.x from official source on both Intel and Apple Silicon.
+          cd "$RUNNER_TEMP"
+          curl --fail --location --silent --show-error --retry 3 \
+            -o nasm-2.16.03.tar.xz \
+            https://www.nasm.us/pub/nasm/releasebuilds/2.16.03/nasm-2.16.03.tar.xz
+          tar -xf nasm-2.16.03.tar.xz
+          cd nasm-2.16.03
+          ./configure --prefix="$RUNNER_TEMP/nasm-2.16.03-installed"
+          make -j"$(sysctl -n hw.ncpu)"
+          make install
+          echo "$RUNNER_TEMP/nasm-2.16.03-installed/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/nasm-2.16.03-installed/bin/nasm" --version
 
       - name: Install flutter
         uses: subosito/flutter-action@v2
@@ -329,7 +457,7 @@ jobs:
         run: |
           cd "$(dirname "$(which flutter)")"
           # https://github.com/flutter/flutter/issues/133533
-          sed -i -e 's/_setFramesEnabledState(false);/\/\/_setFramesEnabledState(false);/g' ../packages/flutter/lib/src/scheduler/binding.dart
+          sed -i '' -e 's/_setFramesEnabledState(false);/\/\/_setFramesEnabledState(false);/g' ../packages/flutter/lib/src/scheduler/binding.dart
           grep -n '_setFramesEnabledState(false);' ../packages/flutter/lib/src/scheduler/binding.dart
         
       - name: Install Rust toolchain
@@ -344,7 +472,7 @@ jobs:
           prefix-key: ${{ matrix.job.os }}
 
       - name: Magick stuff for macOS
-        if: ${{ env.iconlink_url != 'false' }}
+        if: ${{ env.iconlink_url != '' && env.iconlink_url != 'false' }}
         continue-on-error: false
         shell: bash
         run: |
@@ -356,10 +484,10 @@ jobs:
           mkdir -p ./rustdesk/data/flutter_assets/assets
 
           # Download icon using curl with additional SSL options
-          curl -k -L --tlsv1.2 --proto =https --ssl-reqd \
+          curl --fail --silent --show-error --noproxy '*' --location \
             -H "User-Agent: Mozilla/5.0" \
             "${{ env.iconlink_url }}/get_png?filename=${{ env.iconlink_file }}&uuid=${{ env.iconlink_uuid }}" \
-            -o ./res/icon.png || wget --no-check-certificate -O ./res/icon.png "${{ env.iconlink_url }}/get_png?filename=${{ env.iconlink_file }}&uuid=${{ env.iconlink_uuid }}"
+            -o ./res/icon.png || wget -O ./res/icon.png "${{ env.iconlink_url }}/get_png?filename=${{ env.iconlink_file }}&uuid=${{ env.iconlink_uuid }}"
             
           # Backup existing files (if they exist)
           [ -f "./res/32x32.png" ] && mv ./res/32x32.png ./res/32x32.png.bak
@@ -454,7 +582,7 @@ jobs:
           ls -lh rustdesk/data/flutter_assets/assets/
 
       - name: replace flutter icons
-        if: ${{ env.iconlink_url != 'false' }}
+        if: ${{ env.iconlink_url != '' && env.iconlink_url != 'false' }}
         continue-on-error: false
         shell: bash
         run: |
@@ -478,7 +606,7 @@ jobs:
           cd ..
       
       - name: ui.rs
-        if: ${{ env.iconlink_url != 'false' }}
+        if: ${{ env.iconlink_url != '' && env.iconlink_url != 'false' }}
         continue-on-error: true
         shell: bash
         run: |
@@ -497,7 +625,7 @@ jobs:
           # Precise fix: only extend the direct-connection condition with the
           # key check, instead of globally replacing !key.is_empty() with
           # false (which would also disable TCP encryption and UDP logic).
-          sed -i -e 's#if is_local || peer_nat_type == NatType::SYMMETRIC {#if is_local || peer_nat_type == NatType::SYMMETRIC || !key.is_empty() {#' ./src/client.rs
+          sed -i '' -e 's#if is_local || peer_nat_type == NatType::SYMMETRIC {#if is_local || peer_nat_type == NatType::SYMMETRIC || !key.is_empty() {#' ./src/client.rs
           grep -n "key.is_empty()" ./src/client.rs || true
   
       - name: use X for offline display instead of orange circle
@@ -518,8 +646,8 @@ jobs:
         continue-on-error: true
         if: env.removeNewVersionNotif == 'true'
         run: | 
-          sed -i -e 's|updateUrl.isNotEmpty|false|' ./flutter/lib/desktop/pages/desktop_home_page.dart
-          sed -i '/let (request, url) =/,/Ok(())/{/Ok(())/!d}' ./src/common.rs
+          sed -i '' -e 's|updateUrl.isNotEmpty|false|' ./flutter/lib/desktop/pages/desktop_home_page.dart
+          sed -i '' '/let (request, url) =/,/Ok(())/{/Ok(())/!d}' ./src/common.rs
 
       - name: Restore bridge files
         uses: actions/download-artifact@master
@@ -572,12 +700,12 @@ jobs:
         run: |
           if [ "${{ matrix.job.target }}" = "aarch64-apple-darwin" ]; then
             MIN_MACOS_VERSION="12.3"
-            sed -i -e "s/MACOSX_DEPLOYMENT_TARGET\=[0-9]*.[0-9]*/MACOSX_DEPLOYMENT_TARGET=${MIN_MACOS_VERSION}/" build.py
-            sed -i -e "s/platform :osx, '.*'/platform :osx, '${MIN_MACOS_VERSION}'/" flutter/macos/Podfile
-            sed -i -e "s/osx_minimum_system_version = \"[0-9]*.[0-9]*\"/osx_minimum_system_version = \"${MIN_MACOS_VERSION}\"/" Cargo.toml
-            sed -i -e "s/MACOSX_DEPLOYMENT_TARGET = [0-9]*.[0-9]*;/MACOSX_DEPLOYMENT_TARGET = ${MIN_MACOS_VERSION};/" flutter/macos/Runner.xcodeproj/project.pbxproj
+            sed -i '' -e "s/MACOSX_DEPLOYMENT_TARGET\=[0-9]*.[0-9]*/MACOSX_DEPLOYMENT_TARGET=${MIN_MACOS_VERSION}/" build.py
+            sed -i '' -e "s/platform :osx, '.*'/platform :osx, '${MIN_MACOS_VERSION}'/" flutter/macos/Podfile
+            sed -i '' -e "s/osx_minimum_system_version = \"[0-9]*.[0-9]*\"/osx_minimum_system_version = \"${MIN_MACOS_VERSION}\"/" Cargo.toml
+            sed -i '' -e "s/MACOSX_DEPLOYMENT_TARGET = [0-9]*.[0-9]*;/MACOSX_DEPLOYMENT_TARGET = ${MIN_MACOS_VERSION};/" flutter/macos/Runner.xcodeproj/project.pbxproj
           fi
-          sed -i -e "s/RustDesk.app/\"${{ env.appname }}.app\"/" build.py
+          sed -i '' -e "s/RustDesk.app/\"${{ env.appname }}.app\"/" build.py
           ./build.py --flutter --hwcodec --unix-file-copy-paste ${{ matrix.job.extra-build-args }}
 
       # - name: Copy service file
@@ -587,13 +715,18 @@ jobs:
       - name: Embed custom config into the .app bundle
         shell: bash
         run: |
-          APP=$(find ./flutter/build/macos/Build/Products/Release -maxdepth 1 -name "*.app" | head -n 1)
-          echo "App bundle: $APP"
-          echo -n '${{ env.custom }}' > "$APP/Contents/MacOS/custom_.txt"
-          ls -l "$APP/Contents/MacOS/custom_.txt"
+          set -euo pipefail
+          APP=$(find ./flutter/build/macos/Build/Products/Release -maxdepth 1 -type d -name "*.app" | head -n 1)
+          if [ -z "$APP" ] || [ ! -d "$APP/Contents/MacOS" ]; then
+            echo 'ERRORE: bundle .app o cartella Contents/MacOS non trovati'
+            exit 1
+          fi
+          echo "App bundle individuato: $APP"
+          printf '%s' '${{ env.custom }}' > "$APP/Contents/MacOS/custom_.txt"
+          echo 'Configurazione personalizzata inclusa nel bundle'
       
       - name: Install rcodesign tool
-        if: env.MACOS_P12_BASE64 != null
+        if: env.MACOS_P12_BASE64 != ''
         shell: bash
         run: |
           pushd /tmp
@@ -602,16 +735,6 @@ jobs:
           mv apple-codesign-0.22.0-macos-universal/rcodesign /usr/local/bin
           popd
 
-      - name: Install build runtime
-        run: |
-          brew install llvm create-dmg nasm cmake gcc wget ninja
-          # pkg-config is handled in a separate step, because it may be already installed by `macos-latest`(14.7.1) runner
-          if command -v pkg-config &>/dev/null; then
-              echo "pkg-config is already installed"
-          else
-              brew install pkg-config
-          fi
-  
       - name: Show version information (Rust, cargo, Clang)
         shell: bash
         run: |
@@ -623,7 +746,7 @@ jobs:
           rustc -V
       
       - name: icon svg handling
-        if: ${{ env.iconlink_url != 'false' }}
+        if: ${{ env.iconlink_url != '' && env.iconlink_url != 'false' }}
         continue-on-error: false
         shell: bash
         run: |
@@ -639,17 +762,17 @@ jobs:
           rm ./temp_icon.pbm
 
       - name: logo handling
-        if: ${{ env.logolink_url != 'false' }}
+        if: ${{ env.logolink_url != '' && env.logolink_url != 'false' }}
         continue-on-error: false
         shell: bash
         run: |
           ASSETS_DIR="build/macos/Build/Products/Release/RustDesk.app/Contents/Frameworks/App.framework/Versions/Current/Resources/flutter_assets/assets"
           mkdir -p "$ASSETS_DIR"
-          curl -k -L --tlsv1.2 --proto =https --ssl-reqd \
+          curl --fail --silent --show-error --noproxy '*' --location \
             -H "User-Agent: Mozilla/5.0" \
             "${{ env.logolink_url }}/get_png?filename=${{ env.logolink_file }}&uuid=${{ env.logolink_uuid }}" \
             -o "$ASSETS_DIR/logo.png" || \
-          wget --no-check-certificate \
+          wget \
             -O "$ASSETS_DIR/logo.png" \
             "${{ env.logolink_url }}/get_png?filename=${{ env.logolink_file }}&uuid=${{ env.logolink_uuid }}"
 
@@ -787,13 +910,24 @@ jobs:
       - name: send file to rdgen server
         if: ${{ env.rdgen == 'true' }}
         shell: bash
+        env:
+          RDGEN_TOKEN: ${{ env.token }}
+          RDGEN_UUID: ${{ env.uuid }}
+          RDGEN_URL: ${{ secrets.GENURL }}
+          RDGEN_FILENAME: ${{ env.filename }}
         run: |
-          curl -i -X POST \
-            -H "Content-Type: multipart/form-data" \
-            -H "Authorization: Bearer ${{ env.token }}" \
-            -F "file=@$GITHUB_WORKSPACE/${{ env.filename }}-${{ matrix.job.arch }}.dmg" \
-            -F "uuid=${{ env.uuid }}" \
-            "${{ secrets.GENURL }}/save_custom_client"
+          set -euo pipefail
+          DMG_FILE="$GITHUB_WORKSPACE/${RDGEN_FILENAME}-${{ matrix.job.arch }}.dmg"
+          if [ ! -s "$DMG_FILE" ]; then
+            echo "ERRORE: DMG mancante o vuoto"
+            exit 1
+          fi
+          curl --fail --silent --show-error --noproxy '*' --retry 3 --retry-delay 5 -X POST \
+            -H "Authorization: Bearer ${RDGEN_TOKEN}" \
+            -F "file=@${DMG_FILE}" \
+            -F "uuid=${RDGEN_UUID}" \
+            "${RDGEN_URL%/}/save_custom_client"
+          echo "DMG caricato con successo sul server RDGen"
         
 
       - name: send file to api server
@@ -805,6 +939,16 @@ jobs:
             -H "Authorization: Bearer ${{ env.token }}" \
             -F "file=@$GITHUB_WORKSPACE/${{ env.filename }}-${{ matrix.job.arch }}.dmg" \
             "${{ env.apiServer }}/api/save_custom_client"
+
+      - name: Disconnetti NetBird macOS
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          if command -v netbird >/dev/null 2>&1; then
+            netbird down || true
+            sudo -n "$(command -v netbird)" service stop || true
+          fi
 
   cleanup:
     needs: [build-for-macos]
