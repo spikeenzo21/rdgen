@@ -1,0 +1,105 @@
+name: Test RDGen via NetBird macOS
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-macos:
+    name: NetBird RDGen / ${{ matrix.arch }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15-intel
+            arch: intel
+          - os: macos-15
+            arch: apple-silicon
+
+    steps:
+      - name: Verifica configurazione privata
+        shell: bash
+        env:
+          NB_SETUP_KEY: ${{ secrets.NETBIRD_SETUP_KEY }}
+          NB_MANAGEMENT_URL: ${{ vars.NETBIRD_MANAGEMENT_URL }}
+          RDGEN_URL: ${{ secrets.GENURL }}
+        run: |
+          set -euo pipefail
+          if [ -z "$NB_SETUP_KEY" ]; then
+            echo 'ERRORE: secret NETBIRD_SETUP_KEY mancante'
+            exit 1
+          fi
+          if [ -z "$NB_MANAGEMENT_URL" ]; then
+            echo 'ERRORE: variable NETBIRD_MANAGEMENT_URL mancante'
+            exit 1
+          fi
+          if [ -z "$RDGEN_URL" ]; then
+            echo 'ERRORE: secret GENURL mancante'
+            exit 1
+          fi
+          if [[ "$NB_MANAGEMENT_URL" != https://* ]]; then
+            echo 'ERRORE: management NetBird deve usare HTTPS'
+            exit 1
+          fi
+          echo 'Secrets e variable richiesti: presenti'
+
+      - name: Installa NetBird CLI su macOS
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install netbirdio/tap/netbird
+          NB_BIN="$(command -v netbird)"
+          "$NB_BIN" version
+          sudo -n "$NB_BIN" service install
+          sudo -n "$NB_BIN" service start
+
+      - name: Connetti NetBird self-hosted
+        shell: bash
+        env:
+          NB_SETUP_KEY: ${{ secrets.NETBIRD_SETUP_KEY }}
+          NB_MANAGEMENT_URL: ${{ vars.NETBIRD_MANAGEMENT_URL }}
+          NB_HOSTNAME: rdgen-macos-${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          for attempt in {1..12}; do
+            if netbird up --setup-key "$NB_SETUP_KEY" --management-url "$NB_MANAGEMENT_URL" --hostname "$NB_HOSTNAME" >/dev/null 2>&1; then
+              echo 'Connessione NetBird richiesta: OK'
+              exit 0
+            fi
+            echo "NetBird non ancora pronto: tentativo ${attempt}/12"
+            sleep 5
+          done
+          echo 'ERRORE: impossibile collegare NetBird al management privato'
+          exit 1
+
+      - name: Verifica accesso RDGen privato (HTTP 200)
+        shell: bash
+        env:
+          RDGEN_URL: ${{ secrets.GENURL }}
+        run: |
+          set -euo pipefail
+          for attempt in {1..15}; do
+            status="$(curl --noproxy '*' --silent --output /dev/null --write-out '%{http_code}' --connect-timeout 5 --max-time 10 "${RDGEN_URL%/}/" || true)"
+            if [ "$status" = '200' ]; then
+              echo 'RDGen HTTP 200: TEST MACOS RIUSCITO'
+              exit 0
+            fi
+            echo "RDGen non ancora raggiungibile: ${attempt}/15 (HTTP ${status})"
+            sleep 5
+          done
+          echo 'ERRORE: RDGen non raggiungibile via NetBird su macOS'
+          exit 1
+
+      - name: Disconnetti NetBird
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          if command -v netbird >/dev/null 2>&1; then
+            netbird down || true
+            sudo -n "$(command -v netbird)" service stop || true
+          fi
