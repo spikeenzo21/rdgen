@@ -96,7 +96,7 @@ jobs:
         with:
           setup-key: ${{ secrets.NETBIRD_SETUP_KEY }}
           management-url: ${{ vars.NETBIRD_MANAGEMENT_URL }}
-          peer-name: rdgen-android-${{ matrix.job.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+          peer-name: rdgen-android-${{ strategy.job-index }}-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Verifica RDGen privato - Android
         shell: bash
