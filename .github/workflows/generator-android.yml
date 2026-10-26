@@ -517,11 +517,45 @@ jobs:
           echo 'Android custom configuration embedded (value hidden)'
 
       - name: change app id to custom
-        if: env.androidappid != 'com.carriez.flutter_hbb'
-        continue-on-error: true
+        if: ${{ env.androidappid != 'com.carriez.flutter_hbb' && env.androidappid != '' }}
+        shell: bash
+        env:
+          CUSTOM_ANDROID_APP_ID: ${{ env.androidappid }}
+        run: |
+          set -euo pipefail
+          BUILD_GRADLE_PATH="flutter/android/app/build.gradle"
+          # IMPORTANT: change applicationId ONLY; the Kotlin code still uses
+          # package com.carriez.flutter_hbb, which must match Gradle namespace.
+          if [[ ! "$CUSTOM_ANDROID_APP_ID" =~ ^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+$ ]]; then
+            echo '::error::Invalid Android applicationId'
+            exit 1
+          fi
+          if ! grep -Eq '^[[:space:]]*applicationId[[:space:]]+"[^"]+"' "$BUILD_GRADLE_PATH"; then
+            echo '::error::applicationId missing in build.gradle'
+            exit 1
+          fi
+          sed -i -E 's|^([[:space:]]*applicationId[[:space:]]+)"[^"]+"|\1"'"${CUSTOM_ANDROID_APP_ID}"'"|' "$BUILD_GRADLE_PATH"
+          if ! grep -Fq "applicationId \"${CUSTOM_ANDROID_APP_ID}\"" "$BUILD_GRADLE_PATH"; then
+            echo '::error::applicationId was not updated'
+            exit 1
+          fi
+          echo 'Android applicationId updated; Kotlin namespace unchanged'
+
+      - name: Verify Kotlin package and Android namespace
         shell: bash
         run: |
-          sed -i -e 's|com.carriez.flutter_hbb|${{ env.androidappid }}|' ./flutter/android/app/build.gradle
+          set -euo pipefail
+          BUILD_GRADLE_PATH="flutter/android/app/build.gradle"
+          KOTLIN_PATH="flutter/android/app/src/main/kotlin/com/carriez/flutter_hbb/MainService.kt"
+          if ! grep -Eq '^[[:space:]]*namespace[[:space:]]+"com\.carriez\.flutter_hbb"[[:space:]]*$' "$BUILD_GRADLE_PATH"; then
+            echo '::error::Gradle namespace must remain com.carriez.flutter_hbb for RustDesk 1.5.0'
+            exit 1
+          fi
+          if ! grep -Eq '^package[[:space:]]+com\.carriez\.flutter_hbb[[:space:]]*$' "$KOTLIN_PATH"; then
+            echo '::error::Kotlin package does not match Gradle namespace'
+            exit 1
+          fi
+          echo 'OK: Android R class and Kotlin namespace are aligned'
 
       - name: change download link to custom
         if: env.downloadLink != 'https://rustdesk.com/download'
