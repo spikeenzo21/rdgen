@@ -50,6 +50,9 @@ jobs:
     uses: ./.github/workflows/fetch-encrypted-secrets.yml
     with:
       zip_url_json: ${{ inputs.zip_url }}
+      use_netbird: true
+    secrets:
+      NETBIRD_SETUP_KEY: ${{ secrets.NETBIRD_SETUP_KEY }}
 
   generate-bridge-linux:
     uses: ./.github/workflows/bridge.yml
@@ -88,6 +91,29 @@ jobs:
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
+      - name: Connetti NetBird - Android
+        uses: ankurk91/netbird-action@v2
+        with:
+          setup-key: ${{ secrets.NETBIRD_SETUP_KEY }}
+          management-url: ${{ vars.NETBIRD_MANAGEMENT_URL }}
+          peer-name: rdgen-android-${{ matrix.job.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Verifica RDGen privato - Android
+        shell: bash
+        env:
+          RDGEN_URL: ${{ secrets.GENURL }}
+        run: |
+          for attempt in {1..12}; do
+            code="$(curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' --connect-timeout 5 --max-time 10 "${RDGEN_URL}/" || true)"
+            if [ "$code" = '200' ]; then
+              echo 'RDGen privato raggiungibile: HTTP 200'
+              exit 0
+            fi
+            echo "RDGen non pronto, tentativo ${attempt}/12 (HTTP ${code})"
+            sleep 5
+          done
+          echo 'ERRORE: RDGen privato non raggiungibile via NetBird'
+          exit 1
         
       - uses: actions/download-artifact@v4
         with:
@@ -352,7 +378,6 @@ jobs:
             sed -i '/ic_launcher_background/d' ./flutter/android/app/src/main/res/values/colors.xml
 
       - name: set server, serverPort, key, and apiserver
-        continue-on-error: true
         shell: bash
         env:
           SERVER_DOMAIN: ${{ env.server }}
@@ -398,7 +423,21 @@ jobs:
           sed -i -e "s|https://admin.rustdesk.com|$API_SERVER|" ./src/common.rs
 
           echo "=== Verification ==="
-          grep -nE "RENDEZVOUS_PORT|RELAY_PORT|WS_" ./libs/hbb_common/src/config.rs
+          # Error if RDGen did not pass the required BetterDesk settings.
+          if [ -z "$SERVER_DOMAIN" ] || [ -z "$SERVER_PORT_INPUT" ] || [ -z "$SERVER_KEY" ] || [ -z "$API_SERVER" ]; then
+            echo '::error::RDGen configuration incomplete (server, port, key or API)'
+            exit 1
+          fi
+          # `sed` succeeds even if a source-code placeholder was not present.
+          # Verify the resulting files without printing the public key.
+          if ! grep -Fq -- "$SERVER_DOMAIN" ./libs/hbb_common/src/config.rs || \
+             ! grep -Fq -- "pub const RENDEZVOUS_PORT: i32 = $SERVER_PORT;" ./libs/hbb_common/src/config.rs || \
+             ! grep -Fq -- "$SERVER_KEY" ./libs/hbb_common/src/config.rs || \
+             ! grep -Fq -- "$API_SERVER" ./src/common.rs; then
+            echo '::error::BetterDesk customization was not applied to the RustDesk source'
+            exit 1
+          fi
+          echo 'BetterDesk server, port, public key and API customizations present'
           # ./flutter/pubspec.yaml
           #sed -i '/intl:/a \ \ archive: ^3.6.1' ./flutter/pubspec.yaml
           
@@ -459,14 +498,23 @@ jobs:
       # read_custom_client() runs and presets the password + permissions.
       - name: Embed custom config for Android
         shell: bash
+        env:
+          CUSTOM_CONFIG: ${{ env.custom }}
         run: |
+          # No partial config values in GitHub Actions logs.
+          if [ -z "$CUSTOM_CONFIG" ]; then
+            echo '::error::Missing encrypted RDGen Android client configuration'
+            exit 1
+          fi
           KOTLIN=./flutter/android/app/src/main/kotlin/com/carriez/flutter_hbb/MainService.kt
           DART=./flutter/lib/models/native_model.dart
-          sed -i -E "s|FFI\.startServer\(configPath, (homePath, )?\"\"\)|FFI.startServer(configPath, \1\"${{ env.custom }}\")|" "$KOTLIN"
-          sed -i "s|customClientConfig: '',|customClientConfig: '${{ env.custom }}',|" "$DART"
-          echo "--- verify ---"
-          grep -n 'FFI.startServer(configPath' "$KOTLIN" | sed 's/\(.\{80\}\).*/\1.../'
-          grep -n 'customClientConfig:' "$DART" | sed 's/\(.\{80\}\).*/\1.../'
+          sed -i -E "s|FFI\.startServer\(configPath, (homePath, )?\"\"\)|FFI.startServer(configPath, \1\"$CUSTOM_CONFIG\")|" "$KOTLIN"
+          sed -i "s|customClientConfig: '',|customClientConfig: '$CUSTOM_CONFIG',|" "$DART"
+          if ! grep -Fq -- "$CUSTOM_CONFIG" "$KOTLIN" || ! grep -Fq -- "$CUSTOM_CONFIG" "$DART"; then
+            echo '::error::Android configuration was not embedded in Kotlin and Dart'
+            exit 1
+          fi
+          echo 'Android custom configuration embedded (value hidden)'
 
       - name: change app id to custom
         if: env.androidappid != 'com.carriez.flutter_hbb'
@@ -659,8 +707,9 @@ jobs:
       
       - uses: r0adkll/sign-android-release@v1
         name: Sign app APK
-        continue-on-error: true
-        if: env.ANDROID_SIGNING_KEY != null
+        # If a release keystore is configured, a signing error must fail the build.
+        # With no keystore, retain the existing debug-signed APK for testing only.
+        if: ${{ env.ANDROID_SIGNING_KEY != '' }}
         id: sign-rustdesk
         with:
           releaseDirectory: ./signed-apk
@@ -700,7 +749,7 @@ jobs:
           retry_wait_seconds: 15
           shell: bash
           command: |
-            curl -i -X POST -H "Content-Type: multipart/form-data" -H "Authorization: Bearer ${{ env.token }}" -F "file=@./signed-apk/${{ env.filename }}-${{ matrix.job.arch }}.apk" -F "uuid=${{ env.uuid }}" ${{ secrets.GENURL }}/save_custom_client
+            curl --fail --silent --show-error --noproxy '*' -X POST -H "Authorization: Bearer ${{ env.token }}" -F "file=@./signed-apk/${{ env.filename }}-${{ matrix.job.arch }}.apk" -F "uuid=${{ env.uuid }}" "${{ secrets.GENURL }}/save_custom_client"
 
       - name: send file to api server
         if: ${{ env.rdgen == 'false' }}
@@ -712,13 +761,43 @@ jobs:
           shell: bash
           command: |
             curl -i -X POST -H "Content-Type: multipart/form-data" -H "Authorization: Bearer ${{ env.token }}" -F "file=@./signed-apk/${{ env.filename }}-${{ matrix.job.arch }}.apk" ${{ env.apiServer }}/api/save_custom_client
-
+      - name: Disconnetti NetBird
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          if command -v netbird >/dev/null 2>&1; then
+            sudo netbird down || true
+          fi
   deploy:
     needs: [build-rustdesk-android]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
+      - name: Connetti NetBird - deploy Android
+        uses: ankurk91/netbird-action@v2
+        with:
+          setup-key: ${{ secrets.NETBIRD_SETUP_KEY }}
+          management-url: ${{ vars.NETBIRD_MANAGEMENT_URL }}
+          peer-name: rdgen-android-deploy-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Verifica RDGen privato - deploy Android
+        shell: bash
+        env:
+          RDGEN_URL: ${{ secrets.GENURL }}
+        run: |
+          for attempt in {1..12}; do
+            code="$(curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' --connect-timeout 5 --max-time 10 "${RDGEN_URL}/" || true)"
+            if [ "$code" = '200' ]; then
+              echo 'RDGen privato raggiungibile: HTTP 200'
+              exit 0
+            fi
+            echo "RDGen non pronto, tentativo ${attempt}/12 (HTTP ${code})"
+            sleep 5
+          done
+          echo 'ERRORE: RDGen privato non raggiungibile via NetBird'
+          exit 1
         
       - uses: actions/download-artifact@v4
         with:
@@ -753,7 +832,14 @@ jobs:
         continue-on-error: true
         with:
             name: ${{ env.filename }}-*.deb
-
+      - name: Disconnetti NetBird
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          if command -v netbird >/dev/null 2>&1; then
+            sudo netbird down || true
+          fi
   cleanup:
     needs: [build-rustdesk-android, deploy]
     runs-on: ubuntu-latest
